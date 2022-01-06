@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use thiserror::Error;
 
 pub const SOCKS_VER: u8 = 0x05;
+pub const SOCKS_AUTH_VER: u8 = 0x01;
 pub const SOCKS_RSV: u8 = 0x00;
 pub const SOCKS_COMMAND_CONNECT: u8 = 0x01;
 pub const SOCKS_ADDR_IPV4: u8 = 0x01;

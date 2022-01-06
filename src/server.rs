@@ -6,7 +6,7 @@ use std::{
     ops::{Deref, DerefMut},
     sync::Arc,
 };
-use std::borrow::Borrow;
+use std::collections::HashMap;
 use thiserror::Error;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream};
@@ -30,33 +30,43 @@ pub enum Socks5ServerError {
     #[error(transparent)]
     IOError(#[from] io::Error),
 }
+
+#[derive(Debug, Clone)]
+pub struct Client {
+    pub password: String,
+    pub gateway: SocketAddr
+}
+
+pub type Clients = HashMap<String, Client>;
+
 pub struct Socks5Server {
     conn: TcpSocket,
-    auth: Arc<AuthMethod>,
+    clients: Arc<Clients>
 }
-pub fn new(addr: SocketAddr, auth: Option<AuthMethod>) -> Result<Socks5Server> {
+
+pub fn new(addr: SocketAddr, clients: Arc<Clients>) -> Result<Socks5Server> {
     let conn = match addr {
         SocketAddr::V4(_) => TcpSocket::new_v4()?,
         SocketAddr::V6(_) => TcpSocket::new_v6()?,
     };
     conn.bind(addr)?;
 
-    let auth = auth.unwrap_or(AuthMethod::NoAuth);
-    let auth = Arc::new(auth);
-    Ok(Socks5Server { conn, auth })
+    Ok(Socks5Server { conn, clients })
 }
 
 impl Socks5Server {
     pub async fn run(self) -> Result<()> {
+        info!("Starting on {}", self.conn.local_addr()?);
         let conn = self.conn.listen(1024)?;
         loop {
             let (conn, source) = conn.accept().await?;
-
-            let auth = self.auth.clone();
+            println!("Accepted connection from {}", source);
+            let cs = self.clients.clone();
             tokio::spawn(async move {
-                let result = handle_client(conn, auth).await;
+                let result = handle_client(conn, cs).await;
                 if let Err(e) = result {
                     error!("{:?}, source {}", e, source);
+                    println!("{:?}, source {}", e, source);
                 }
             });
         }
@@ -65,7 +75,7 @@ impl Socks5Server {
 
 impl_deref!(PendingHandshake, TcpStream);
 impl PendingHandshake {
-    async fn handshake(mut self, auth: &Arc<AuthMethod>) -> Result<PendingAuthenticate> {
+    async fn handshake(mut self) -> Result<PendingAuthenticate> {
         let mut header = [0u8; 2];
         self.read_exact(&mut header).await?;
         if header[0] != SOCKS_VER {
@@ -75,15 +85,13 @@ impl PendingHandshake {
         for _ in 0..header[1] {
             let mut m = [0u8; 1];
             self.read_exact(&mut m).await?;
-            if m[0] == auth.to_code() {
-                matched = true;
-            }
+            matched = 0x02 == m[0]; // check for auth_method ~ user_pass
         }
         if !matched {
             return Err(Socks5ServerError::UnsupportAuth);
         }
 
-        self.write_all(&[SOCKS_VER, auth.to_code()]).await?;
+        self.write_all(&[SOCKS_VER, 0x02]).await?;
         self.flush().await?;
 
         Ok(PendingAuthenticate(self.0))
@@ -92,59 +100,63 @@ impl PendingHandshake {
 
 impl_deref!(PendingAuthenticate, TcpStream);
 impl PendingAuthenticate {
-    async fn authenticate(mut self, auth: &Arc<AuthMethod>) -> Result<PendingCommand> {
-        match auth.borrow() {
-            AuthMethod::NoAuth => Ok(PendingCommand(self.0)),
-            AuthMethod::UserPass(user_auth) => {
-                //read data
-                let mut header = [0u8; 2];
-                self.read_exact(&mut header).await?;
+    async fn authenticate(mut self, clients: &Arc<Clients>) -> Result<PendingCommand> {
+        let mut header = [0u8; 2];
+        self.read_exact(&mut header).await?;
 
-                let name_lenth = header[1];
-                let pass_lenth;
-                let mut one_byte = [0u8; 1];
-                let mut name_vec: Vec<u8> = Vec::new();
-                let mut pass_vec: Vec<u8> = Vec::new();
+        let name_lenth = header[1];
+        let pass_lenth;
+        let mut one_byte = [0u8; 1];
+        let mut name_vec: Vec<u8> = Vec::new();
+        let mut pass_vec: Vec<u8> = Vec::new();
 
-                for _i in 0..name_lenth {
-                    self.read_exact(&mut one_byte).await?;
-                    name_vec.push(one_byte[0]);
-                }
+        for _i in 0..name_lenth {
+            self.read_exact(&mut one_byte).await?;
+            name_vec.push(one_byte[0]);
+        }
 
-                self.read_exact(&mut one_byte).await?;
-                pass_lenth = one_byte[0];
+        self.read_exact(&mut one_byte).await?;
+        pass_lenth = one_byte[0];
 
-                for _i in 0..pass_lenth {
-                    self.read_exact(&mut one_byte).await?;
-                    pass_vec.push(one_byte[0]);
-                }
+        for _i in 0..pass_lenth {
+            self.read_exact(&mut one_byte).await?;
+            pass_vec.push(one_byte[0]);
+        }
 
-                let user_name = String::from_utf8_lossy(&name_vec).to_string();
-                let user_pwd = String::from_utf8_lossy(&pass_vec).to_string();
+        let user_name = String::from_utf8_lossy(&name_vec).to_string();
+        let user_pwd = String::from_utf8_lossy(&pass_vec).to_string();
 
-                let x = user_auth.as_ref().unwrap();
-                if x.0 == user_name && x.1 == user_pwd {
-                    //Authentication succeeded
-                    self.write_all(&[SOCKS_VER, SocksError::SUCCESS as u8]).await?;
-                    self.flush().await?;
-                    Ok(PendingCommand(self.0))
-                } else {
-                    //Authentication fail
-                    self.write_all(&[SOCKS_VER, SocksError::FAIL as u8]).await?;
-                    self.flush().await?;
-                    Err(Socks5ServerError::UnsupportAuth)
-                }
+
+        match clients.as_ref().get(&user_name) {
+            None => {
+                self.write_all(&[SOCKS_AUTH_VER, SocksError::FAIL as u8]).await?;
+                self.flush().await?;
+                Err(Socks5ServerError::UnsupportAuth)
             }
-            _ => Err(Socks5ServerError::UnsupportAuth),
+            Some(Client { password, .. }) if *password != user_pwd => {
+                self.write_all(&[SOCKS_AUTH_VER, SocksError::FAIL as u8]).await?;
+                self.flush().await?;
+                Err(Socks5ServerError::UnsupportAuth)
+            },
+            Some(Client { gateway, .. }) => {
+                //Authentication succeeded
+                self.write_all(&[SOCKS_AUTH_VER, SocksError::SUCCESS as u8]).await?;
+                self.flush().await?;
+                Ok(PendingCommand { conn: self.0, gateway: gateway.clone() })
+            }
         }
     }
 }
 
-impl_deref!(PendingCommand, TcpStream);
+struct PendingCommand {
+    conn: TcpStream,
+    gateway: SocketAddr
+}
+
 impl PendingCommand {
     async fn handle_command(&mut self) -> Result<SocketAddr> {
         let mut header = [0u8; 4];
-        self.read_exact(&mut header).await?;
+        self.conn.read_exact(&mut header).await?;
         if header[0] != SOCKS_VER || header[2] != SOCKS_RSV {
             return Err(Socks5ServerError::UnknowProtocol);
         } else if header[1] != SOCKS_COMMAND_CONNECT {
@@ -154,7 +166,7 @@ impl PendingCommand {
         match header[3] {
             SOCKS_ADDR_IPV4 => {
                 let mut buffer = [0u8; 4 + 2];
-                self.read_exact(&mut buffer).await?;
+                self.conn.read_exact(&mut buffer).await?;
                 let ip: [u8; 4] = buffer[..4].try_into().unwrap();
                 let ip: Ipv4Addr = Ipv4Addr::from(ip);
                 let port = u16::from_be_bytes([buffer[4], buffer[5]]);
@@ -164,7 +176,7 @@ impl PendingCommand {
             }
             SOCKS_ADDR_IPV6 => {
                 let mut buffer = [0u8; 16 + 2];
-                self.read_exact(&mut buffer).await?;
+                self.conn.read_exact(&mut buffer).await?;
                 let ip: [u8; 16] = buffer[..16].try_into().unwrap();
                 let ip = Ipv6Addr::from(ip);
                 let port = u16::from_be_bytes([buffer[16], buffer[17]]);
@@ -174,11 +186,11 @@ impl PendingCommand {
             }
             SOCKS_ADDR_DOMAINNAME => {
                 let mut buffer = [0u8; 255];
-                self.read_exact(&mut buffer[..1]).await?;
+                self.conn.read_exact(&mut buffer[..1]).await?;
                 let len = buffer[0];
-                self.read_exact(&mut buffer[..len as usize]).await?;
+                self.conn.read_exact(&mut buffer[..len as usize]).await?;
                 let mut port = [0u8; 2];
-                self.read_exact(&mut port).await?;
+                self.conn.read_exact(&mut port).await?;
                 let port = u16::from_be_bytes(port);
                 let host = std::str::from_utf8(&buffer[..len as usize])?;
                 let sock = (host, port).to_socket_addrs()?.next();
@@ -193,16 +205,16 @@ impl PendingCommand {
         }
     }
     async fn reply(mut self, content: &[u8]) -> Result<TcpStream> {
-        self.write_all(&content).await?;
-        self.flush().await?;
-        Ok(self.0)
+        self.conn.write_all(&content).await?;
+        self.conn.flush().await?;
+        Ok(self.conn)
     }
 }
-async fn handle_client(conn: TcpStream, auth: Arc<AuthMethod>) -> Result<()> {
+async fn handle_client(conn: TcpStream, cs: Arc<Clients>) -> Result<()> {
     let mut conn = PendingHandshake(conn)
-        .handshake(&auth)
+        .handshake()
         .await?
-        .authenticate(&auth)
+        .authenticate(&cs)
         .await?;
     let addr = conn.handle_command().await;
     let mut rep = [
@@ -232,7 +244,9 @@ async fn handle_client(conn: TcpStream, auth: Arc<AuthMethod>) -> Result<()> {
     };
 
     // --------------------------------
-    let delegate = TcpStream::connect(addr).await;
+    let sc = TcpSocket::new_v4()?;
+    sc.bind(conn.gateway)?;
+    let delegate = sc.connect(addr).await;
     let delegate = match delegate {
         Ok(c) => c,
         Err(e) => {
