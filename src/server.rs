@@ -125,12 +125,12 @@ impl PendingAuthenticate {
                 let x = user_auth.as_ref().unwrap();
                 if x.0 == user_name && x.1 == user_pwd {
                     //Authentication succeeded
-                    self.write_all(&[SOCKS_VER, SocksError::SUCCESS as u8]).await?;
+                    self.write_all(&[0x01, SocksError::SUCCESS as u8]).await?;
                     self.flush().await?;
                     Ok(PendingCommand(self.0))
                 } else {
                     //Authentication fail
-                    self.write_all(&[SOCKS_VER, SocksError::FAIL as u8]).await?;
+                    self.write_all(&[0x01, SocksError::FAIL as u8]).await?;
                     self.flush().await?;
                     Err(Socks5ServerError::UnsupportAuth)
                 }
