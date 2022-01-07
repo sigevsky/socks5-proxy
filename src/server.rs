@@ -144,6 +144,8 @@ impl_deref!(PendingCommand, TcpStream);
 impl PendingCommand {
     async fn handle_command(&mut self) -> Result<SocketAddr> {
         let mut header = [0u8; 4];
+        let n = self.read(&mut header).await?;
+        println!("Read {} bytes", n);
         self.read_exact(&mut header).await?;
         if header[0] != SOCKS_VER || header[2] != SOCKS_RSV {
             return Err(Socks5ServerError::UnknowProtocol);
